@@ -6,17 +6,82 @@ import (
 	"github.com/grandcat/zeroconf"
 
 	//"errors"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log"
+	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 )
 
 type ApiServer struct {
 	MdnsServer *zeroconf.Server
+	HttpServer *http.Server
 	Port       int
+	logger     *log.Logger
+	mux        *http.ServeMux
+	printer    Printer
+	jobId      int
+}
+
+func New(printer Printer) (*ApiServer, error) {
+	freePort, err := NewPort()
+	if err != nil {
+		return nil, errors.New("Failed to get a free port")
+	}
+	log.Print("Sharing "+printer.Name+" on port ", freePort)
+	apiserver := &ApiServer{printer: printer, mux: http.NewServeMux(), Port: freePort}
+
+	mdnsServer, err := PrivetPublish(printer, freePort)
+	if err != nil {
+		return nil, err
+	}
+	apiserver.MdnsServer = mdnsServer
+	apiserver.mux.HandleFunc("/privet/info", apiserver.handleInfoRequest)
+	apiserver.mux.HandleFunc("/privet/capabilities", apiserver.handleCapability)
+	apiserver.mux.HandleFunc("/privet/printer/submitdoc", apiserver.handleSubmitDoc)
+
+	//startHttpServer(freePort)
+	return apiserver, nil
+}
+
+func Publish(printer Printer) (*ApiServer, error) {
+	apiServer, err := New(printer)
+	if err != nil {
+		return nil, err
+	}
+	apiServer.HttpServer = &http.Server{
+		Addr:    ":" + strconv.Itoa(apiServer.Port),
+		Handler: apiServer,
+	}
+	log.Print("Starting Publish ", printer.Name)
+
+	go func() {
+		if err := apiServer.HttpServer.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+
+	log.Print("Completed Publish ", printer.Name)
+	return apiServer, nil
+}
+
+func (apiServer *ApiServer) Shutdown() error {
+	if apiServer.MdnsServer != nil {
+		apiServer.MdnsServer.Shutdown()
+	}
+	if apiServer.HttpServer != nil {
+		if err := apiServer.HttpServer.Shutdown(context.Background()); err != nil {
+			log.Printf("Error: %v\n", err)
+			return err
+		} else {
+			log.Println("Unpublising " + apiServer.printer.Name)
+		}
+	}
+	return nil
 }
 
 var (
@@ -93,12 +158,16 @@ var (
 }`
 )
 
+func (apiServer *ApiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	apiServer.mux.ServeHTTP(w, r)
+}
+
 //"/privet/info"
-func handleInfoRequest(w http.ResponseWriter, r *http.Request) {
+func (apiServer *ApiServer) handleInfoRequest(w http.ResponseWriter, r *http.Request) {
 	//w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	//w.WriteHeader(http.StatusOK)
-	log.Print("Some body requested for info ")
-	info := PrinterInfo{"1.0", "Test Xerox", "Near my Cube", "https://www.google.com/cloudprint",
+	log.Print("Sending info of ", apiServer.printer.Name)
+	info := PrinterInfo{"1.0", apiServer.printer.Name, apiServer.printer.Location, "https://www.google.com/cloudprint",
 						[]string{"printer"}, "", "idle", "offline", "Google", "Google Chrome", "1111-22222-33333-4444",
 						"24.0.1312.52", 600, "http://support.google.com/cloudprint/answer/1686197/?hl=en",
 						"http://support.google.com/cloudprint/?hl=en", "http://support.google.com/cloudprint/?hl=en",
@@ -118,18 +187,30 @@ func handleInfoRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 //"/privet/capabilities"
-func handleCapability(w http.ResponseWriter, r *http.Request) {
+func (apiServer *ApiServer) handleCapability(w http.ResponseWriter, r *http.Request) {
 	//w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	log.Print("Capabilities")
+	log.Print("Sending Capabilities ", apiServer.printer.Name)
 	w.Write([]byte(cddEx))
+}
+func (apiServer *ApiServer) getNextJobId() int {
+	apiServer.jobId++
+	return apiServer.jobId
 }
 
 //"/privet/printer/submitdoc"
-func handleSubmitDoc(w http.ResponseWriter, r *http.Request) {
+func (apiServer *ApiServer) handleSubmitDoc(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
-		log.Print("Content Type" + r.Header.Get("Content-Type"))
-		out, err := os.Create("/tmp/test.pdf")
+		//log.Print("Content Type" + r.Header.Get("Content-Type"))
+		requestedIp := net.ParseIP(r.RemoteAddr)
+		log.Print("Request from ", requestedIp)
+		log.Print("Printing Document for ", apiServer.printer.Name)
+		newpath := filepath.Join("/tmp", apiServer.printer.Name+"-jobs/")
+		os.MkdirAll(newpath, os.ModePerm)
+		jobId := apiServer.getNextJobId()
+		jobName := "job" + strconv.Itoa(jobId) + ".pdf"
+		jobFilePath := filepath.Join(newpath, jobName)
+		out, err := os.Create(jobFilePath)
 		if err != nil {
 			log.Panic(err)
 		}
@@ -147,35 +228,26 @@ func handleSubmitDoc(w http.ResponseWriter, r *http.Request) {
 		//	"job_name": "My PDF document"
 		//}
 
-		submitDocResp := SubmitDocResp{"123", 500, "application/pdf", 123123, "My Pdf Document"}
+		submitDocResp := SubmitDocResp{strconv.Itoa(jobId), 500, "application/pdf", 123123, jobName}
 		jdata, err := json.Marshal(submitDocResp)
 		if err != nil {
 			log.Panic(err)
 		}
+		log.Print("Printing done.  JobID ", jobId, " Job Name:", jobName)
 		w.Write(jdata)
 	}
 }
-func PublishAsGCloudPrinter(printer Printer) (*ApiServer, error) {
-	freePort, err := NewPort()
-	if err != nil {
-		return nil, errors.New("Failed to get a free port")
-	}
-	log.Print("Sharing on port ", freePort)
-	mdnsServer, err := PrivetPublish(printer, freePort)
-	if err != nil {
-		return nil, err
-	}
-	http.HandleFunc("/privet/info", handleInfoRequest)
-	http.HandleFunc("/privet/capabilities", handleCapability)
-	http.HandleFunc("/privet/printer/submitdoc", handleSubmitDoc)
 
-	//http.HandleFunc("/", any)
-
-	http.ListenAndServe(":"+strconv.Itoa(freePort), nil)
-
-	//httpServer := &http.Server{
-	//	Addr:    strconv.Itoa(freePort),
-	//	Handler: &privetApiServer{}}
-	server := ApiServer{mdnsServer, freePort}
-	return &server, nil
-}
+//func startHttpServer(freePort int) *http.Server {
+//	srv := &http.Server{Addr: ":" + strconv.Itoa(freePort)}
+//
+//	go func() {
+//		if err := srv.ListenAndServe(); err != nil {
+//			// cannot panic, because this probably is an intentional close
+//			log.Printf("Httpserver: ListenAndServe() error: %s", err)
+//		}
+//	}()
+//
+//	// returning reference so caller can call Shutdown()
+//	return srv
+//}
